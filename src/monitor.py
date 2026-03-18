@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import smtplib
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from email.utils import formataddr
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import requests
+
+ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
+STATE_PATH = Path("data/state.json")
+DEFAULT_TZ = os.getenv("REPORT_TIMEZONE", "Asia/Shanghai")
+MAX_SAMPLES = 800
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+@dataclass
+class PriceSample:
+    timestamp_utc: str
+    price: float
+    currency: str
+    metal: str
+    exchange: str | None = None
+
+
+
+def require_env(name: str, default: str | None = None) -> str:
+    value = os.getenv(name, default)
+    if value is None or not str(value).strip():
+        raise ConfigError(f"Missing required environment variable: {name}")
+    return str(value).strip()
+
+
+
+def load_state() -> dict[str, Any]:
+    if not STATE_PATH.exists():
+        return {"samples": []}
+    return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+
+def fetch_gold_spot(api_key: str) -> PriceSample:
+    params = {
+        "function": "GOLD_SILVER_SPOT",
+        "symbol": "XAU",
+        "apikey": api_key,
+    }
+    response = requests.get(ALPHA_VANTAGE_URL, params=params, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+
+    if "Error Message" in payload:
+        raise RuntimeError(f"Alpha Vantage error: {payload['Error Message']}")
+    if "Note" in payload:
+        raise RuntimeError(f"Alpha Vantage note: {payload['Note']}")
+
+    price = payload.get("price") or payload.get("spot_price") or payload.get("value")
+    if price is None:
+        raise RuntimeError(f"Unexpected Alpha Vantage payload: {payload}")
+
+    ts = payload.get("timestamp")
+    timestamp = datetime.now(timezone.utc)
+    if ts:
+        try:
+            timestamp = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            pass
+
+    return PriceSample(
+        timestamp_utc=timestamp.replace(microsecond=0).isoformat(),
+        price=float(price),
+        currency=str(payload.get("currency", "USD")),
+        metal=str(payload.get("metal", "Gold")),
+        exchange=payload.get("exchange"),
+    )
+
+
+
+def last_sample(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return samples[-1] if samples else None
+
+
+
+def pct_change(current: float, previous: float) -> float:
+    if previous == 0:
+        return 0.0
+    return (current - previous) / previous * 100.0
+
+
+
+def format_price(value: float) -> str:
+    return f"{value:,.2f}"
+
+
+
+def format_change(value: float) -> str:
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:,.2f}"
+
+
+
+def format_pct(value: float) -> str:
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.3f}%"
+
+
+
+def parse_iso_utc(ts: str) -> datetime:
+    return datetime.fromisoformat(ts).astimezone(timezone.utc)
+
+
+
+def summarize_window(samples: list[dict[str, Any]], hours: int = 24) -> dict[str, Any]:
+    if not samples:
+        return {}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    window = [s for s in samples if parse_iso_utc(s["timestamp_utc"]) >= cutoff]
+    if not window:
+        window = samples[-1:]
+
+    prices = [float(s["price"]) for s in window]
+    minimum = min(prices)
+    maximum = max(prices)
+    avg = sum(prices) / len(prices)
+    span = maximum - minimum
+    span_pct = pct_change(maximum, minimum) if minimum else 0.0
+    return {
+        "count": len(window),
+        "min": minimum,
+        "max": maximum,
+        "avg": avg,
+        "span": span,
+        "span_pct": span_pct,
+        "first_ts": window[0]["timestamp_utc"],
+        "last_ts": window[-1]["timestamp_utc"],
+    }
+
+
+
+def build_email(sample: PriceSample, previous: dict[str, Any] | None, state: dict[str, Any], report_tz: str) -> tuple[str, str]:
+    tz = ZoneInfo(report_tz)
+    ts_local = parse_iso_utc(sample.timestamp_utc).astimezone(tz)
+    ts_sh = parse_iso_utc(sample.timestamp_utc).astimezone(ZoneInfo("Asia/Shanghai"))
+    ts_ldn = parse_iso_utc(sample.timestamp_utc).astimezone(ZoneInfo("Europe/London"))
+    samples = state.get("samples", [])
+    window = summarize_window(samples, hours=24)
+
+    if previous:
+        prev_price = float(previous["price"])
+        delta = sample.price - prev_price
+        delta_pct = pct_change(sample.price, prev_price)
+        previous_line = (
+            f"较上一次采样变化: {format_change(delta)} {sample.currency}/oz "
+            f"({format_pct(delta_pct)})\n"
+            f"上一次采样时间: {previous['timestamp_utc']}"
+        )
+    else:
+        previous_line = "这是首次采样，暂无上一次对比数据。"
+
+    body = f"""伦敦金（XAU/USD）整点监测
+
+当前价格: {format_price(sample.price)} {sample.currency}/oz
+采样时间(UTC): {sample.timestamp_utc}
+采样时间(上海): {ts_sh.strftime('%Y-%m-%d %H:%M:%S %Z')}
+采样时间(伦敦): {ts_ldn.strftime('%Y-%m-%d %H:%M:%S %Z')}
+采样时间(报告时区): {ts_local.strftime('%Y-%m-%d %H:%M:%S %Z')}
+数据来源字段: metal={sample.metal}, exchange={sample.exchange or 'N/A'}
+
+{previous_line}
+
+最近24小时统计
+样本数: {window.get('count', 0)}
+最低: {format_price(window.get('min', sample.price))} {sample.currency}/oz
+最高: {format_price(window.get('max', sample.price))} {sample.currency}/oz
+均值: {format_price(window.get('avg', sample.price))} {sample.currency}/oz
+振幅: {format_change(window.get('span', 0.0))} {sample.currency}/oz ({format_pct(window.get('span_pct', 0.0))})
+窗口起点(UTC): {window.get('first_ts', sample.timestamp_utc)}
+窗口终点(UTC): {window.get('last_ts', sample.timestamp_utc)}
+
+说明
+1. GitHub Actions 在整点高峰可能延迟，因此工作流默认设为每小时第 2 分钟运行。
+2. 本邮件展示的是 XAU/USD 现货金价格，可用作“伦敦金”波动监测。
+3. 本工具仅做监测提醒，不构成投资建议。
+"""
+
+    subject = (
+        f"[伦敦金小时监测] {format_price(sample.price)} {sample.currency}/oz | "
+        f"{format_pct(pct_change(sample.price, float(previous['price'])) if previous else 0.0)}"
+    )
+    return subject, body
+
+
+
+def send_email(subject: str, body: str) -> None:
+    smtp_host = require_env("SMTP_HOST")
+    smtp_port = int(require_env("SMTP_PORT", "587"))
+    smtp_username = require_env("SMTP_USERNAME")
+    smtp_password = require_env("SMTP_PASSWORD")
+    email_from = require_env("EMAIL_FROM")
+    email_to = require_env("EMAIL_TO")
+    sender_name = os.getenv("EMAIL_SENDER_NAME", "London Gold Monitor")
+
+    message = MIMEText(body, _charset="utf-8")
+    message["Subject"] = subject
+    message["From"] = formataddr((sender_name, email_from))
+    message["To"] = email_to
+
+    if os.getenv("DRY_RUN", "0") == "1":
+        print("[DRY_RUN] Email not sent.")
+        print(subject)
+        print(body)
+        return
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.sendmail(email_from, [item.strip() for item in email_to.split(",") if item.strip()], message.as_string())
+
+
+
+def main() -> None:
+    api_key = require_env("ALPHAVANTAGE_API_KEY")
+    state = load_state()
+    samples: list[dict[str, Any]] = state.setdefault("samples", [])
+
+    sample = fetch_gold_spot(api_key)
+    prev = last_sample(samples)
+
+    samples.append(
+        {
+            "timestamp_utc": sample.timestamp_utc,
+            "price": sample.price,
+            "currency": sample.currency,
+            "metal": sample.metal,
+            "exchange": sample.exchange,
+        }
+    )
+    if len(samples) > MAX_SAMPLES:
+        state["samples"] = samples[-MAX_SAMPLES:]
+
+    subject, body = build_email(sample, prev, state, os.getenv("REPORT_TIMEZONE", DEFAULT_TZ))
+    send_email(subject, body)
+    save_state(state)
+    print("Monitor run completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
