@@ -1,3 +1,11 @@
 {
-  "samples": []
+  "samples": [
+    {
+      "timestamp_utc": "2026-03-18T16:16:00+00:00",
+      "price": 4877.5634034467,
+      "currency": "USD",
+      "metal": "Gold",
+      "exchange": null
+    }
+  ]
 }
