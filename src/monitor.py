@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import smtplib
 from dataclasses import dataclass
@@ -16,8 +15,15 @@ import requests
 
 ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
 STATE_PATH = Path("data/state.json")
-DEFAULT_TZ = os.getenv("REPORT_TIMEZONE", "Asia/Shanghai")
+DEFAULT_TZ = "Asia/Shanghai"
 MAX_SAMPLES = 800
+
+# 固定摘要时间（报告时区）
+SUMMARY_HOURS = {10, 14, 18}
+
+# 波动提醒阈值
+ALERT_ABS_CHANGE = 10.0   # 价格变化超过 10 美元/oz
+ALERT_PCT_CHANGE = 0.4    # 百分比变化超过 0.4%
 
 
 class ConfigError(RuntimeError):
@@ -33,13 +39,11 @@ class PriceSample:
     exchange: str | None = None
 
 
-
 def require_env(name: str, default: str | None = None) -> str:
     value = os.getenv(name, default)
     if value is None or not str(value).strip():
         raise ConfigError(f"Missing required environment variable: {name}")
     return str(value).strip()
-
 
 
 def load_state() -> dict[str, Any]:
@@ -48,11 +52,9 @@ def load_state() -> dict[str, Any]:
     return json.loads(STATE_PATH.read_text(encoding="utf-8"))
 
 
-
 def save_state(state: dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 
 def fetch_gold_spot(api_key: str) -> PriceSample:
@@ -91,10 +93,8 @@ def fetch_gold_spot(api_key: str) -> PriceSample:
     )
 
 
-
 def last_sample(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
     return samples[-1] if samples else None
-
 
 
 def pct_change(current: float, previous: float) -> float:
@@ -103,10 +103,8 @@ def pct_change(current: float, previous: float) -> float:
     return (current - previous) / previous * 100.0
 
 
-
 def format_price(value: float) -> str:
     return f"{value:,.2f}"
-
 
 
 def format_change(value: float) -> str:
@@ -114,16 +112,13 @@ def format_change(value: float) -> str:
     return f"{sign}{value:,.2f}"
 
 
-
 def format_pct(value: float) -> str:
     sign = "+" if value > 0 else ""
     return f"{sign}{value:.3f}%"
 
 
-
 def parse_iso_utc(ts: str) -> datetime:
     return datetime.fromisoformat(ts).astimezone(timezone.utc)
-
 
 
 def summarize_window(samples: list[dict[str, Any]], hours: int = 24) -> dict[str, Any]:
@@ -152,9 +147,36 @@ def summarize_window(samples: list[dict[str, Any]], hours: int = 24) -> dict[str
     }
 
 
+def should_send(sample: PriceSample, previous: dict[str, Any] | None, report_tz: str) -> tuple[bool, str | None]:
+    now_local = parse_iso_utc(sample.timestamp_utc).astimezone(ZoneInfo(report_tz))
 
-def build_email(sample: PriceSample, previous: dict[str, Any] | None, state: dict[str, Any], report_tz: str) -> tuple[str, str]:
-    tz = ZoneInfo(report_tz)
+    # 固定摘要时间
+    if now_local.hour in SUMMARY_HOURS:
+        return True, "scheduled"
+
+    # 波动提醒
+    if previous:
+        prev_price = float(previous["price"])
+        delta = abs(sample.price - prev_price)
+        delta_pct = abs(pct_change(sample.price, prev_price))
+        if delta >= ALERT_ABS_CHANGE or delta_pct >= ALERT_PCT_CHANGE:
+            return True, "volatility"
+
+    return False, None
+
+
+def build_email(
+    sample: PriceSample,
+    previous: dict[str, Any] | None,
+    state: dict[str, Any],
+    report_tz: str,
+    reason: str,
+) -> tuple[str, str]:
+    try:
+        tz = ZoneInfo(report_tz or DEFAULT_TZ)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TZ)
+
     ts_local = parse_iso_utc(sample.timestamp_utc).astimezone(tz)
     ts_sh = parse_iso_utc(sample.timestamp_utc).astimezone(ZoneInfo("Asia/Shanghai"))
     ts_ldn = parse_iso_utc(sample.timestamp_utc).astimezone(ZoneInfo("Europe/London"))
@@ -171,9 +193,18 @@ def build_email(sample: PriceSample, previous: dict[str, Any] | None, state: dic
             f"上一次采样时间: {previous['timestamp_utc']}"
         )
     else:
+        delta = 0.0
+        delta_pct = 0.0
         previous_line = "这是首次采样，暂无上一次对比数据。"
 
-    body = f"""伦敦金（XAU/USD）整点监测
+    if reason == "scheduled":
+        subject_prefix = "[定时摘要]"
+        title = "伦敦金定时摘要"
+    else:
+        subject_prefix = "[波动提醒]"
+        title = "伦敦金波动提醒"
+
+    body = f"""{title}
 
 当前价格: {format_price(sample.price)} {sample.currency}/oz
 采样时间(UTC): {sample.timestamp_utc}
@@ -193,6 +224,10 @@ def build_email(sample: PriceSample, previous: dict[str, Any] | None, state: dic
 窗口起点(UTC): {window.get('first_ts', sample.timestamp_utc)}
 窗口终点(UTC): {window.get('last_ts', sample.timestamp_utc)}
 
+提醒规则
+1. 固定摘要时间: {", ".join(f"{h:02d}:00" for h in sorted(SUMMARY_HOURS))}
+2. 波动提醒阈值: 单次变化 ≥ {ALERT_ABS_CHANGE:.2f} USD/oz 或 ≥ {ALERT_PCT_CHANGE:.3f}%
+
 说明
 1. GitHub Actions 在整点高峰可能延迟，因此工作流默认设为每小时第 2 分钟运行。
 2. 本邮件展示的是 XAU/USD 现货金价格，可用作“伦敦金”波动监测。
@@ -200,11 +235,10 @@ def build_email(sample: PriceSample, previous: dict[str, Any] | None, state: dic
 """
 
     subject = (
-        f"[伦敦金小时监测] {format_price(sample.price)} {sample.currency}/oz | "
-        f"{format_pct(pct_change(sample.price, float(previous['price'])) if previous else 0.0)}"
+        f"{subject_prefix} {format_price(sample.price)} {sample.currency}/oz | "
+        f"{format_pct(delta_pct if previous else 0.0)}"
     )
     return subject, body
-
 
 
 def send_email(subject: str, body: str) -> None:
@@ -242,9 +276,10 @@ def send_email(subject: str, body: str) -> None:
             server.sendmail(email_from, recipients, message.as_string())
 
 
-
 def main() -> None:
     api_key = require_env("ALPHAVANTAGE_API_KEY")
+    report_tz = os.getenv("REPORT_TIMEZONE") or DEFAULT_TZ
+
     state = load_state()
     samples: list[dict[str, Any]] = state.setdefault("samples", [])
 
@@ -263,8 +298,15 @@ def main() -> None:
     if len(samples) > MAX_SAMPLES:
         state["samples"] = samples[-MAX_SAMPLES:]
 
-    subject, body = build_email(sample, prev, state, os.getenv("REPORT_TIMEZONE", DEFAULT_TZ))
-    send_email(subject, body)
+    should, reason = should_send(sample, prev, report_tz)
+
+    if should and reason:
+        subject, body = build_email(sample, prev, state, report_tz, reason)
+        send_email(subject, body)
+        print(f"Email sent. reason={reason}")
+    else:
+        print("Skip sending email. No scheduled summary or significant volatility.")
+
     save_state(state)
     print("Monitor run completed successfully.")
 
