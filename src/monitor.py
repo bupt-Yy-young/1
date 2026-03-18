@@ -221,17 +221,25 @@ def send_email(subject: str, body: str) -> None:
     message["From"] = formataddr((sender_name, email_from))
     message["To"] = email_to
 
+    recipients = [item.strip() for item in email_to.split(",") if item.strip()]
+
     if os.getenv("DRY_RUN", "0") == "1":
         print("[DRY_RUN] Email not sent.")
         print(subject)
         print(body)
         return
 
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(smtp_username, smtp_password)
-        server.sendmail(email_from, [item.strip() for item in email_to.split(",") if item.strip()], message.as_string())
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=60) as server:
+            server.login(smtp_username, smtp_password)
+            server.sendmail(email_from, recipients, message.as_string())
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(smtp_username, smtp_password)
+            server.sendmail(email_from, recipients, message.as_string())
 
 
 
