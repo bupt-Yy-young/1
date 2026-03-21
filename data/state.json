@@ -349,6 +349,13 @@
       "currency": "USD",
       "metal": "Gold",
       "exchange": null
+    },
+    {
+      "timestamp_utc": "2026-03-21T05:38:24+00:00",
+      "price": 4491.5518401439,
+      "currency": "USD",
+      "metal": "Gold",
+      "exchange": null
     }
   ]
 }
